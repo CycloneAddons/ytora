@@ -1,4 +1,5 @@
 src/
+scripts/
 downloads/
 *.jsonl
 .oauth-tokens.json
