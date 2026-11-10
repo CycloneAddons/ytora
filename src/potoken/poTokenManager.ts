@@ -1,0 +1,965 @@
+import { Buffer } from 'node:buffer'
+import { appendFile, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { base64ToU8 } from '../sabr/protor.ts'
+import { logger } from '../utils/logger.ts'
+import { resolveDefaultLogDir } from '../utils/paths.ts'
+
+const PO_CONFIG = {
+  apiKey: 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw',
+  userAgent:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+  ytBaseUrl: 'https://www.youtube.com',
+  googBaseUrl: 'https://jnn-pa.googleapis.com'
+}
+
+const textEncoder = new TextEncoder()
+
+function parseLooseJSON(looseJson: string): Record<string, unknown> {
+  const sanitized = looseJson.replace(/\\x([0-9A-Fa-f]{2})/g, (_, hex) =>
+    String.fromCharCode(Number.parseInt(hex, 16))
+  )
+  let jsonStr = sanitized.replace(/,\s*([\]}])/g, '$1')
+  jsonStr = jsonStr.replace(/'((?:[^'\\]|\\[\s\S])*)'/g, (_, inner: string) =>
+    JSON.stringify(inner.replace(/\\'/g, "'"))
+  )
+  jsonStr = jsonStr.replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":')
+  const parsed = JSON.parse(jsonStr) as Record<string, unknown>
+  for (const k in parsed) {
+    const v = parsed[k]
+    if (
+      typeof v === 'string' &&
+      (v.trim().startsWith('{') || v.trim().startsWith('['))
+    ) {
+      try {
+        parsed[k] = JSON.parse(v) as unknown
+      } catch {}
+    }
+  }
+  return parsed
+}
+
+class DeferredPromise<T> {
+  public readonly promise: Promise<T>
+  public resolve!: (value: T | PromiseLike<T>) => void
+  public reject!: (reason?: unknown) => void
+
+  constructor() {
+    this.promise = new Promise<T>((resolve, reject) => {
+      this.resolve = resolve
+      this.reject = reject
+    })
+  }
+}
+
+function u8ToBase64(u8: Uint8Array, base64url = false): string {
+  if (!base64url) return Buffer.from(u8).toString('base64')
+
+  const s = Buffer.from(u8)
+    .toString('base64')
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+  const pad = s.indexOf('=')
+  return pad === -1 ? s : s.slice(0, pad)
+}
+
+function buildURL(endpointName: string, useYouTubeAPI: boolean): string {
+  return `${useYouTubeAPI ? PO_CONFIG.ytBaseUrl : PO_CONFIG.googBaseUrl}/${useYouTubeAPI ? 'api/jnn/v1' : '$rpc/google.internal.waa.v1.Waa'}/${endpointName}`
+}
+
+interface BotGuardVmFunctions {
+  asyncSnapshotFunction: (
+    callback: (response: string) => void,
+    args: [
+      string | undefined,
+      string | undefined,
+      unknown[],
+      boolean | undefined
+    ]
+  ) => void
+  shutdownFunction: () => void
+  passEventFunction: (event: unknown) => void
+  checkCameraFunction: () => void
+}
+
+interface BotGuardVm {
+  a: (
+    program: string,
+    cb: (
+      asyncSnapshotFunction: BotGuardVmFunctions['asyncSnapshotFunction'],
+      shutdownFunction: BotGuardVmFunctions['shutdownFunction'],
+      passEventFunction: BotGuardVmFunctions['passEventFunction'],
+      checkCameraFunction: BotGuardVmFunctions['checkCameraFunction']
+    ) => void,
+    flag: boolean,
+    u1: undefined,
+    fn: () => void,
+    arr: unknown[]
+  ) => Promise<[unknown]>
+}
+
+class BotGuardClient {
+  private readonly deferredVmFunctions =
+    new DeferredPromise<BotGuardVmFunctions>()
+  private readonly defaultTimeout = 3000
+  private readonly vm: BotGuardVm
+  private readonly program: string
+  private shutdownFunction: BotGuardVmFunctions['shutdownFunction'] | null =
+    null
+  private previousOnerror: PropertyDescriptor | undefined
+  private installedOnerror: unknown
+
+  private constructor(options: {
+    globalObj: Record<string, unknown>
+    globalName: string
+    program: string
+  }) {
+    this.vm = options.globalObj[options.globalName] as BotGuardVm
+    this.program = options.program
+  }
+
+  public static async create(options: {
+    globalObj: Record<string, unknown>
+    globalName: string
+    program: string
+  }): Promise<BotGuardClient> {
+    return await new BotGuardClient(options).load()
+  }
+
+  private async load(): Promise<this> {
+    if (!this.vm) throw new Error('VM not found')
+    if (!this.vm.a) throw new Error('VM init function not found')
+    this.previousOnerror = Object.getOwnPropertyDescriptor(Object, 'onerror')
+
+    const vmFunctionsCallback = (
+      asyncSnapshotFunction: BotGuardVmFunctions['asyncSnapshotFunction'],
+      shutdownFunction: BotGuardVmFunctions['shutdownFunction'],
+      passEventFunction: BotGuardVmFunctions['passEventFunction'],
+      checkCameraFunction: BotGuardVmFunctions['checkCameraFunction']
+    ) => {
+      this.shutdownFunction = shutdownFunction
+      this.deferredVmFunctions.resolve({
+        asyncSnapshotFunction,
+        shutdownFunction,
+        passEventFunction,
+        checkCameraFunction
+      })
+    }
+
+    try {
+      await this.vm.a(
+        this.program,
+        vmFunctionsCallback,
+        true,
+        undefined,
+        () => {},
+        [[], []]
+      )
+      this.installedOnerror = Object.getOwnPropertyDescriptor(
+        Object,
+        'onerror'
+      )?.value
+    } catch (error) {
+      this.installedOnerror = Object.getOwnPropertyDescriptor(
+        Object,
+        'onerror'
+      )?.value
+      try {
+        this.shutdown()
+      } catch {}
+      const message = error instanceof Error ? error.message : String(error)
+      throw new Error(`Could not load program: ${message}`)
+    }
+
+    return this
+  }
+
+  public shutdown(): void {
+    const shutdownFunction = this.shutdownFunction
+    this.shutdownFunction = null
+    const ownsOnerror =
+      this.installedOnerror !== undefined &&
+      Object.getOwnPropertyDescriptor(Object, 'onerror')?.value ===
+        this.installedOnerror
+    try {
+      shutdownFunction?.()
+    } finally {
+      if (ownsOnerror) {
+        if (this.previousOnerror) {
+          Object.defineProperty(Object, 'onerror', this.previousOnerror)
+        } else {
+          Reflect.deleteProperty(Object, 'onerror')
+        }
+      }
+      this.installedOnerror = undefined
+      this.previousOnerror = undefined
+    }
+  }
+
+  public async snapshot(
+    args: {
+      contentBinding?: string
+      signedTimestamp?: string
+      webPoSignalOutput: unknown[]
+      skipPrivacyBuffer?: boolean
+    },
+    timeout = this.defaultTimeout
+  ): Promise<string> {
+    const vmFunctions = await this.deferredVmFunctions.promise
+    if (!vmFunctions.asyncSnapshotFunction) {
+      throw new Error('Asynchronous snapshot function not found')
+    }
+
+    return await new Promise((resolve, reject) => {
+      const t = setTimeout(
+        () => reject(new Error('VM operation timed out')),
+        timeout
+      )
+      if (t.unref) t.unref()
+
+      vmFunctions.asyncSnapshotFunction(
+        (response) => {
+          clearTimeout(t)
+          resolve(response)
+        },
+        [
+          args.contentBinding,
+          args.signedTimestamp,
+          args.webPoSignalOutput,
+          args.skipPrivacyBuffer
+        ]
+      )
+    })
+  }
+}
+
+class WebPoMinter {
+  private readonly mintCallback: (identifier: Uint8Array) => Promise<Uint8Array>
+
+  private constructor(
+    mintCallback: (identifier: Uint8Array) => Promise<Uint8Array>
+  ) {
+    this.mintCallback = mintCallback
+  }
+
+  public static async create(
+    integrityToken: string,
+    webPoSignalOutput: unknown[]
+  ): Promise<WebPoMinter> {
+    const getMinter = webPoSignalOutput[0] as
+      | ((token: Uint8Array) => Promise<unknown>)
+      | undefined
+    if (!getMinter) throw new Error('PMD:Undefined')
+    if (!integrityToken) throw new Error('No integrity token provided')
+
+    const mintCallback = await getMinter(base64ToU8(integrityToken))
+    if (!(mintCallback instanceof Function)) throw new Error('APF:Failed')
+
+    return new WebPoMinter(
+      mintCallback as (identifier: Uint8Array) => Promise<Uint8Array>
+    )
+  }
+
+  public async mintAsWebsafeString(identifier: string): Promise<string> {
+    return u8ToBase64(await this.mint(identifier), true)
+  }
+
+  public async mint(identifier: string): Promise<Uint8Array> {
+    const result = await this.mintCallback(textEncoder.encode(identifier))
+    if (!result) throw new Error('YNJ:Undefined')
+    if (!(result instanceof Uint8Array)) throw new Error('ODM:Invalid')
+    return result
+  }
+}
+
+interface AttestationChallenge {
+  bg_challenge: {
+    program: string
+    global_name: string
+    interpreter_url: {
+      private_do_not_access_or_else_trusted_resource_url_wrapped_value: string
+    }
+  }
+}
+
+export class PoTokenManager {
+  private botguard: BotGuardClient | null = null
+  private minter: WebPoMinter | null = null
+  private visitorData: string | null = null
+  private integrityToken: string | null = null
+  private initializationPromise: Promise<void> | null = null
+  private initializationGeneration = 0
+  private vmGlobalName: string | null = null
+  private previousVmGlobal: PropertyDescriptor | undefined
+  private installedVmGlobal: unknown
+  private enableDebugLogs = false
+  private logDir: string = resolveDefaultLogDir()
+
+  private _dom: {
+    window: {
+      close: () => void
+      document: unknown
+      location: unknown
+      origin: string
+      navigator: unknown
+    }
+  } | null = null
+  private _prevGlobals: {
+    window: unknown
+    document: unknown
+    location: unknown
+    origin: string
+    hadNavigator: boolean
+  } | null = null
+  private _idleTimer: NodeJS.Timeout | null = null
+
+  public setDebugLogs(enabled: boolean): void {
+    this.enableDebugLogs = enabled
+  }
+
+  public setLogDir(dir: string): void {
+    if (dir && dir.trim()) {
+      this.logDir = dir
+    }
+  }
+
+  private async appendDebugTokenLog(entry: unknown): Promise<void> {
+    try {
+      await mkdir(this.logDir, { recursive: true })
+      await appendFile(
+        path.join(this.logDir, 'po_tokens.jsonl'),
+        `${JSON.stringify(entry)}\n`
+      )
+    } catch {}
+  }
+
+  private _refreshIdleTimer(): void {
+    if (this._idleTimer) clearTimeout(this._idleTimer)
+    this._idleTimer = setTimeout(
+      () => {
+        logger(
+          'debug',
+          'PoToken',
+          'Idle timeout reached. Cleaning up NativeDOM resources.'
+        )
+        this.reset()
+      },
+      10 * 60 * 1000
+    )
+    if (this._idleTimer.unref) this._idleTimer.unref()
+  }
+
+  private _applyDomGlobals(dom: {
+    window: {
+      document: unknown
+      location: unknown
+      origin: string
+      navigator: unknown
+    }
+  }): void {
+    if (!this._prevGlobals) {
+      const g = globalThis as unknown as Record<string, unknown>
+      this._prevGlobals = {
+        window: g.window,
+        document: g.document,
+        location: g.location,
+        origin: String(g.origin || ''),
+        hadNavigator: Reflect.has(g, 'navigator')
+      }
+    }
+
+    Object.assign(globalThis, {
+      window: dom.window,
+      document: dom.window.document,
+      location: dom.window.location,
+      origin: dom.window.origin
+    })
+
+    if (!this._prevGlobals.hadNavigator) {
+      Object.defineProperty(globalThis, 'navigator', {
+        value: dom.window.navigator,
+        configurable: true
+      })
+    }
+  }
+
+  private _cleanupDom(): void {
+    if (this._dom) {
+      this._dom.window.close()
+      this._dom = null
+    }
+
+    const g2 = globalThis as unknown as Record<string, unknown>
+    if (this.vmGlobalName && g2[this.vmGlobalName] === this.installedVmGlobal) {
+      if (this.previousVmGlobal) {
+        Object.defineProperty(g2, this.vmGlobalName, this.previousVmGlobal)
+      } else {
+        Reflect.deleteProperty(g2, this.vmGlobalName)
+      }
+    }
+    this.vmGlobalName = null
+    this.previousVmGlobal = undefined
+    this.installedVmGlobal = undefined
+    try {
+      if ((g2.yt as Record<string, unknown> | undefined)?.config_) {
+        Reflect.deleteProperty(g2, 'yt')
+      }
+    } catch {}
+    const win2 = g2.window as Record<string, unknown> | undefined
+    try {
+      if ((win2?.yt as Record<string, unknown> | undefined)?.config_) {
+        Reflect.deleteProperty(win2 as Record<string, unknown>, 'yt')
+      }
+    } catch {
+      try {
+        if (win2) (win2 as Record<string, unknown>).yt = undefined as unknown
+      } catch {}
+    }
+
+    const p = this._prevGlobals
+    if (!p) return
+
+    const g = g2
+    for (const k of ['window', 'document', 'location', 'origin'] as const) {
+      if (p[k] === undefined) delete g[k]
+      else g[k] = p[k]
+    }
+    if (!p.hadNavigator) delete g.navigator
+
+    this._prevGlobals = null
+  }
+
+  public async fetchVisitorData(): Promise<string> {
+    try {
+      const response = await fetch('https://www.youtube.com', {
+        headers: { 'user-agent': PO_CONFIG.userAgent }
+      })
+      const html = await response.text()
+      const marker = '"VISITOR_DATA":"'
+      const start = html.indexOf(marker)
+      if (start !== -1) {
+        const from = start + marker.length
+        const end = html.indexOf('"', from)
+        if (end !== -1) return html.slice(from, end)
+      }
+      throw new Error('Could not find visitorData in HTML')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger('error', 'PoToken', `Failed to fetch visitorData: ${message}`)
+      return ''
+    }
+  }
+
+  private async getChallengeFromHomepage(): Promise<
+    AttestationChallenge | undefined
+  > {
+    try {
+      const res = await fetch('https://www.youtube.com', {
+        headers: {
+          accept: '*/*',
+          'accept-language': 'en-US,en;q=0.7',
+          'user-agent': PO_CONFIG.userAgent
+        }
+      })
+      if (!res.ok) return undefined
+      const html = await res.text()
+      const ytcfgMatch = html.match(/ytcfg\.set\(({.+?})\);/s)
+      if (ytcfgMatch?.[1]) {
+        try {
+          const ytcfg = JSON.parse(ytcfgMatch[1]) as Record<string, unknown>
+          const ytObj = { config_: ytcfg }
+          ;(globalThis as unknown as Record<string, unknown>).yt = ytObj
+          const win = (globalThis as unknown as Record<string, unknown>)
+            .window as Record<string, unknown> | undefined
+          if (win) win.yt = ytObj
+          if (
+            ytcfg.VISITOR_DATA &&
+            typeof ytcfg.VISITOR_DATA === 'string' &&
+            !this.visitorData
+          ) {
+            this.visitorData = ytcfg.VISITOR_DATA
+          }
+        } catch {}
+      } else {
+        logger('warn', 'PoToken', 'homepage-challenge: no ytcfg found')
+      }
+      const attMatch = html.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/)
+      if (!attMatch?.[1]) {
+        logger('warn', 'PoToken', 'homepage-challenge: no ytAtN in page')
+        return undefined
+      }
+      const attData = parseLooseJSON(attMatch[1]) as Record<string, unknown>
+      const r = (attData.R ?? attData.r) as Record<string, unknown> | undefined
+      const bgChallenge = r?.bgChallenge as
+        | {
+            program?: string
+            globalName?: string
+            interpreterUrl?: {
+              privateDoNotAccessOrElseTrustedResourceUrlWrappedValue?: string
+            }
+          }
+        | undefined
+      if (!bgChallenge?.program || !bgChallenge?.interpreterUrl) {
+        logger(
+          'warn',
+          'PoToken',
+          'homepage-challenge: ytAtN payload missing bgChallenge'
+        )
+        return undefined
+      }
+      logger('debug', 'PoToken', 'Using challenge from homepage (patched)')
+      return {
+        bg_challenge: {
+          program: bgChallenge.program,
+          global_name: bgChallenge.globalName as string,
+          interpreter_url: {
+            private_do_not_access_or_else_trusted_resource_url_wrapped_value:
+              bgChallenge.interpreterUrl
+                .privateDoNotAccessOrElseTrustedResourceUrlWrappedValue as string
+          }
+        }
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      logger(
+        'warn',
+        'PoToken',
+        `homepage-challenge: failed (${msg}), falling back`
+      )
+      return undefined
+    }
+  }
+
+  private async getAttestationChallenge(
+    visitorData: string
+  ): Promise<AttestationChallenge> {
+    const response = await fetch(
+      `${PO_CONFIG.ytBaseUrl}/youtubei/v1/att/get?key=${PO_CONFIG.apiKey}`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'user-agent': PO_CONFIG.userAgent,
+          'x-goog-api-key': PO_CONFIG.apiKey,
+          'x-youtube-client-name': '1',
+          'x-youtube-client-version': '2.20260706.00.00'
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: 'WEB',
+              clientVersion: '2.20260706.00.00',
+              visitorData
+            }
+          },
+          engagementType: 'ENGAGEMENT_TYPE_UNBOUND'
+        })
+      }
+    )
+
+    const text = await response.text()
+    let data: {
+      bgChallenge?: {
+        program: string
+        globalName: string
+        interpreterUrl: {
+          privateDoNotAccessOrElseTrustedResourceUrlWrappedValue: string
+        }
+      }
+    }
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw new Error(
+        `Failed to parse attestation response (Status ${response.status}): ${text.slice(0, 500)}`
+      )
+    }
+
+    if (!data.bgChallenge) {
+      throw new Error(`No bgChallenge in response: ${text.slice(0, 500)}`)
+    }
+
+    return {
+      bg_challenge: {
+        program: data.bgChallenge.program,
+        global_name: data.bgChallenge.globalName,
+        interpreter_url: {
+          private_do_not_access_or_else_trusted_resource_url_wrapped_value:
+            data.bgChallenge.interpreterUrl
+              .privateDoNotAccessOrElseTrustedResourceUrlWrappedValue
+        }
+      }
+    }
+  }
+
+  public async initialize(existingVisitorData?: string): Promise<void> {
+    while (this.initializationPromise) await this.initializationPromise
+
+    if (
+      existingVisitorData &&
+      this.visitorData &&
+      existingVisitorData !== this.visitorData
+    ) {
+      logger(
+        'debug',
+        'PoToken',
+        `VisitorData changed (old: ${this.visitorData.slice(0, 10)}..., new: ${existingVisitorData.slice(0, 10)}...). Resetting.`
+      )
+      this.reset()
+    }
+
+    if (this.botguard && this.minter) return
+
+    logger('debug', 'PoToken', 'Initializing BotGuard...')
+
+    if (existingVisitorData) {
+      this.visitorData = existingVisitorData
+    }
+    logger(
+      'debug',
+      'PoToken',
+      `VisitorData: ${this.visitorData?.slice(0, 20) ?? '(none, will extract from homepage)'}...`
+    )
+
+    const initializationGeneration = this.initializationGeneration
+    this.initializationPromise = this._initializeWithDom()
+    try {
+      await this.initializationPromise
+      if (initializationGeneration !== this.initializationGeneration) {
+        throw new Error('BotGuard initialization was reset')
+      }
+    } catch (error) {
+      this.reset()
+      throw error
+    } finally {
+      this.initializationPromise = null
+    }
+    logger(
+      'debug',
+      'PoToken',
+      'BotGuard initialization with NativeDOM complete'
+    )
+  }
+
+  private async _initializeWithDom(): Promise<void> {
+    this._cleanupDom()
+
+    const { NativeDOM } = await import('./nativeDOM.ts')
+    this._dom = new NativeDOM({
+      url: 'https://www.youtube.com/',
+      referrer: 'https://www.youtube.com/',
+      userAgent: PO_CONFIG.userAgent
+    })
+
+    this._applyDomGlobals(this._dom)
+
+    logger('debug', 'PoToken', 'Fetching attestation challenge...')
+    let challengeResponse: AttestationChallenge | undefined =
+      await this.getChallengeFromHomepage()
+    if (!challengeResponse) {
+      if (!this.visitorData) {
+        const vd = await this.fetchVisitorData()
+        if (vd) this.visitorData = vd
+      }
+      logger(
+        'debug',
+        'PoToken',
+        'Using challenge from /att/get (legacy fallback)'
+      )
+      challengeResponse = await this.getAttestationChallenge(
+        this.visitorData || ''
+      )
+    }
+    if (!challengeResponse.bg_challenge) {
+      throw new Error('Could not get challenge')
+    }
+
+    const interpreterUrl =
+      challengeResponse.bg_challenge.interpreter_url
+        .private_do_not_access_or_else_trusted_resource_url_wrapped_value
+
+    logger('debug', 'PoToken', `Fetching interpreter from: ${interpreterUrl}`)
+    const bgScriptResponse = await fetch(`https:${interpreterUrl}`)
+    const interpreterJavascript = await bgScriptResponse.text()
+    if (!interpreterJavascript) throw new Error('Could not load BotGuard VM')
+
+    this.vmGlobalName = challengeResponse.bg_challenge.global_name
+    this.previousVmGlobal = Object.getOwnPropertyDescriptor(
+      globalThis,
+      this.vmGlobalName
+    )
+    Reflect.deleteProperty(globalThis, this.vmGlobalName)
+    try {
+      new Function(interpreterJavascript)()
+    } finally {
+      this.installedVmGlobal = (
+        globalThis as unknown as Record<string, unknown>
+      )[this.vmGlobalName]
+    }
+
+    logger('debug', 'PoToken', 'Creating BotGuard client...')
+    this.botguard = await BotGuardClient.create({
+      program: challengeResponse.bg_challenge.program,
+      globalName: challengeResponse.bg_challenge.global_name,
+      globalObj: globalThis as unknown as Record<string, unknown>
+    })
+
+    logger('debug', 'PoToken', 'Generating snapshot and creating minter...')
+    const webPoSignalOutput: unknown[] = []
+    const botguardResponse = await this.botguard.snapshot({ webPoSignalOutput })
+
+    const requestKey = 'O43z0dpjhgX20SCx4KAo'
+    const integrityTokenResponse = await fetch(buildURL('GenerateIT', true), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json+protobuf',
+        'x-goog-api-key': PO_CONFIG.apiKey,
+        'x-user-agent': 'grpc-web-javascript/0.1',
+        'user-agent': PO_CONFIG.userAgent
+      },
+      body: JSON.stringify([requestKey, botguardResponse])
+    })
+
+    const response = (await integrityTokenResponse.json()) as unknown[]
+    let token = ''
+    if (response && typeof response[0] === 'string') {
+      token = response[0]
+    } else if (response && typeof response[3] === 'string') {
+      token = response[3]
+    }
+
+    if (!token) throw new Error('Could not get integrity token')
+
+    this.integrityToken = token
+    logger(
+      'debug',
+      'PoToken',
+      `IntegrityToken retrieved. Length: ${this.integrityToken.length}`
+    )
+
+    this.minter = await WebPoMinter.create(
+      this.integrityToken,
+      webPoSignalOutput
+    )
+    logger('debug', 'PoToken', 'Initialization complete')
+  }
+
+  public async generate(
+    videoId: string,
+    existingVisitorData?: string
+  ): Promise<{
+    poToken: string | null
+    visitorData: string | null
+    legacyPoToken: string | null
+  }> {
+    try {
+      logger(
+        'debug',
+        'PoToken',
+        `Generating token for videoId: ${videoId} with existingVisitorData: ${!!existingVisitorData}`
+      )
+
+      await this.initialize(existingVisitorData)
+
+      if (!this.minter || !this.integrityToken || !this.visitorData) {
+        throw new Error('Minter not initialized properly.')
+      }
+
+      const contentPoToken = await this.minter.mintAsWebsafeString(videoId)
+      logger(
+        'debug',
+        'PoToken',
+        `ContentPoToken generated. Length: ${contentPoToken.length}`
+      )
+
+      const legacyPoToken = this.bindToken(
+        this.integrityToken,
+        this.visitorData
+      )
+      logger(
+        'debug',
+        'PoToken',
+        `LegacyPoToken generated. Length: ${legacyPoToken.length}`
+      )
+
+      if (this.enableDebugLogs) {
+        const entry = {
+          ts: new Date().toISOString(),
+          videoId,
+          visitorData: this.visitorData,
+          poToken: contentPoToken,
+          legacyPoToken,
+          integrityToken: `${this.integrityToken?.slice(0, 20)}...`
+        }
+        await this.appendDebugTokenLog(entry)
+      }
+
+      this._refreshIdleTimer()
+
+      return {
+        poToken: contentPoToken,
+        visitorData: this.visitorData,
+        legacyPoToken
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const stack = error instanceof Error ? error.stack : undefined
+
+      logger(
+        'error',
+        'PoToken',
+        `Failed to generate token for ${videoId}: ${message}`
+      )
+
+      if (this.enableDebugLogs) {
+        const errEntry = {
+          ts: new Date().toISOString(),
+          videoId,
+          error: message,
+          stack
+        }
+        await this.appendDebugTokenLog(errEntry)
+      }
+
+      this.reset()
+
+      return { poToken: null, visitorData: null, legacyPoToken: null }
+    }
+  }
+
+  public bindToken(integrityToken: string, visitorData: string): string {
+    const itU8 = base64ToU8(integrityToken)
+    const it = Buffer.from(itU8.buffer, itU8.byteOffset, itU8.byteLength)
+    const vd = Buffer.from(visitorData, 'utf8')
+
+    const len = 10 + it.length + vd.length
+    const buf = Buffer.allocUnsafe(len)
+
+    buf[0] = 0x22
+    buf[1] = len - 2
+
+    buf[2] = 0x5a
+    buf[3] = 0xb3
+    buf[4] = 0x00
+    buf[5] = 0x01
+
+    buf.writeUInt32BE((Date.now() / 1000) | 0, 6)
+
+    it.copy(buf, 10)
+    vd.copy(buf, 10 + it.length)
+
+    for (let i = 4; i < len; i++) {
+      const current = buf[i]
+      if (current !== undefined) {
+        buf[i] = current ^ (i & 1 ? 0xb3 : 0x5a)
+      }
+    }
+
+    return u8ToBase64(buf, true)
+  }
+
+  public async generateStreamingToken(): Promise<string | null> {
+    try {
+      await this.initialize()
+      if (!this.minter || !this.visitorData) {
+        throw new Error('Minter not initialized.')
+      }
+
+      const sessionPoToken = await this.minter.mintAsWebsafeString(
+        this.visitorData
+      )
+      logger(
+        'debug',
+        'PoToken',
+        `StreamingPoToken generated. Length: ${sessionPoToken.length}`
+      )
+
+      this._refreshIdleTimer()
+
+      return sessionPoToken
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger(
+        'error',
+        'PoToken',
+        `Failed to generate streaming token: ${message}`
+      )
+      this.reset()
+      return null
+    }
+  }
+
+  public generateColdStartToken(visitorData?: string): string | null {
+    try {
+      const identifier = visitorData || this.visitorData
+      if (!identifier) {
+        throw new Error('No visitor data available for cold start token.')
+      }
+
+      const encodedIdentifier = textEncoder.encode(identifier)
+      if (encodedIdentifier.length > 118) {
+        throw new Error('Content binding is too long.')
+      }
+
+      const ts = (Date.now() / 1000) | 0
+      const k0 = (Math.random() * 256) | 0
+      const k1 = (Math.random() * 256) | 0
+
+      const packet = new Uint8Array(10 + encodedIdentifier.length)
+      packet[0] = 34
+      packet[1] = 8 + encodedIdentifier.length
+
+      packet[2] = k0
+      packet[3] = k1
+      packet[4] = 0
+      packet[5] = 1
+      packet[6] = (ts >>> 24) & 255
+      packet[7] = (ts >>> 16) & 255
+      packet[8] = (ts >>> 8) & 255
+      packet[9] = ts & 255
+
+      packet.set(encodedIdentifier, 10)
+
+      const payload = packet.subarray(2)
+      for (let i = 2; i < payload.length; i++) {
+        const val = payload[i]
+        const key = payload[i & 1]
+        if (val !== undefined && key !== undefined) {
+          payload[i] = val ^ key
+        }
+      }
+
+      return u8ToBase64(packet, true)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger(
+        'error',
+        'PoToken',
+        `Failed to generate cold start token: ${message}`
+      )
+      return null
+    }
+  }
+
+  public reset(): void {
+    logger('debug', 'PoToken', 'Resetting PoTokenManager state')
+    this.initializationGeneration++
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer)
+      this._idleTimer = null
+    }
+    try {
+      this.botguard?.shutdown()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger('warn', 'PoToken', `Failed to shut down BotGuard: ${message}`)
+    }
+    this.botguard = null
+    this.minter = null
+    this.visitorData = null
+    this.integrityToken = null
+    this._cleanupDom()
+  }
+}
+
+export const poTokenManager = new PoTokenManager()
