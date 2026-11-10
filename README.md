@@ -2,7 +2,7 @@
 
 A fast, standalone YouTube & YouTube Music downloader and Innertube extraction library written in strict TypeScript for Node.js, usable both programmatically via ESM/TypeScript `import` and as a global CLI (`npm i -g ytora`).
 
-## Featuresc
+## Features
 
 - **13 Innertube Clients**: Automatic client rotation across `VisionOs`, `AndroidVR`, `TV_DOWN`, `TV`, `TVCast`, `WebEmbedded`, `WebParentTools`, `Web`, `IOS`, `Android`, `Music`, `WebRemix`, and `TVEmbedded`.
 - **Resilient Streaming Pipelines**:
