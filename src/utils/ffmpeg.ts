@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import path from 'node:path'
 import { promisify } from 'node:util'
 import type { FfmpegInfo } from '../types/index.ts'
 import { logger } from './logger.ts'
@@ -19,7 +20,8 @@ async function probeFfmpegCandidate(bin: string): Promise<string | null> {
 
 export async function resolveFfmpegStaticPath(): Promise<string | null> {
   try {
-    const mod: unknown = await import('ffmpeg-static')
+    const ffmpegStaticPkg = 'ffmpeg-static'
+    const mod: unknown = await import(ffmpegStaticPkg)
     const defaultExport =
       typeof mod === 'object' && mod !== null && 'default' in mod
         ? (mod as { default?: unknown }).default
@@ -51,18 +53,24 @@ export async function detectFfmpegBinary(options?: {
       bin: string
       source: 'env' | 'system'
     }> = []
-
-    if (
-      typeof process.env.FFMPEG_PATH === 'string' &&
-      process.env.FFMPEG_PATH.trim().length > 0
-    ) {
-      candidates.push({ bin: process.env.FFMPEG_PATH.trim(), source: 'env' })
+    const seen = new Set<string>()
+    const addCandidate = (bin: string | undefined, source: 'env' | 'system') => {
+      const trimmed = bin?.trim()
+      if (!trimmed || seen.has(trimmed)) return
+      seen.add(trimmed)
+      candidates.push({ bin: trimmed, source })
     }
-    candidates.push(
-      { bin: 'ffmpeg', source: 'system' },
-      { bin: '/usr/bin/ffmpeg', source: 'system' },
-      { bin: '/usr/local/bin/ffmpeg', source: 'system' }
-    )
+
+    addCandidate(process.env.FFMPEG_PATH, 'env')
+    addCandidate('ffmpeg', 'system')
+    if (process.env.PREFIX?.trim()) {
+      addCandidate(path.join(process.env.PREFIX.trim(), 'bin', 'ffmpeg'), 'system')
+    }
+    if (process.platform === 'android') {
+      addCandidate('/data/data/com.termux/files/usr/bin/ffmpeg', 'system')
+    }
+    addCandidate('/usr/bin/ffmpeg', 'system')
+    addCandidate('/usr/local/bin/ffmpeg', 'system')
 
     for (const { bin, source } of candidates) {
       const versionLine = await probeFfmpegCandidate(bin)

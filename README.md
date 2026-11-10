@@ -25,6 +25,13 @@ A fast, standalone YouTube & YouTube Music downloader and Innertube extraction l
 npm install -g ytora
 ```
 
+Or on Termux (Android):
+
+```bash
+pkg install nodejs-lts git ffmpeg
+npm install -g git+https://github.com/CycloneAddons/ytora.git
+```
+
 Run from anywhere:
 
 ```bash
@@ -163,8 +170,8 @@ Downloads are saved to `./downloads` in the current working directory by default
 Ytora resolves FFmpeg in the following order whenever lossless muxing (`-c copy`) is needed:
 
 1. `FFMPEG_PATH` environment variable (if set and executable)
-2. System `ffmpeg` in `PATH`, `/usr/bin/ffmpeg`, or `/usr/local/bin/ffmpeg`
-3. Bundled [`ffmpeg-static`](https://www.npmjs.com/package/ffmpeg-static) binary (used automatically when system `ffmpeg` is unavailable)
+2. System `ffmpeg` in `PATH`, `$PREFIX/bin/ffmpeg`, `/usr/bin/ffmpeg`, or `/usr/local/bin/ffmpeg`
+3. Bundled [`ffmpeg-static`](https://www.npmjs.com/package/ffmpeg-static) optional binary (used automatically when system `ffmpeg` is unavailable on Linux/macOS/Windows; skipped cleanly on unsupported platforms like Android/Termux where `pkg install ffmpeg` provides native FFmpeg)
 
 If no FFmpeg binary is available or working, `video` mode gracefully falls back to `--progressive`.
 

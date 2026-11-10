@@ -2819,11 +2819,11 @@ export class YouTubeDownloader implements ClientRuntime {
 
     let requestedMode = options.mode
     if (requestedMode === 'video' && !ffmpegInfo) {
-      logger(
-        'warn',
-        'Downloader',
-        'ffmpeg not found (checked FFMPEG_PATH, system PATH, and ffmpeg-static); falling back to progressive single-file mode.'
-      )
+      const hint =
+        process.platform === 'android'
+          ? 'ffmpeg not found (run "pkg install ffmpeg" on Termux or set FFMPEG_PATH); falling back to progressive single-file mode.'
+          : 'ffmpeg not found (checked FFMPEG_PATH, system PATH, and ffmpeg-static); falling back to progressive single-file mode.'
+      logger('warn', 'Downloader', hint)
       requestedMode = 'progressive'
     }
 
